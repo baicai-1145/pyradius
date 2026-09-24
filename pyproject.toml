@@ -1,0 +1,51 @@
+[project]
+name = "pyradius"
+version = "0.1.0"
+description = "Pure-Python/NumPy time-domain (TD) and phase-vocoder pitch shifters"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "baicai-1145", email = "3423714059@qq.com" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Multimedia :: Sound/Audio :: Sound Synthesis",
+]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+fast = ["numba>=0.59"]
+
+[project.scripts]
+pyr-td = "pyradius.cli_td:main"
+pyr-vc = "pyradius.cli_vc:main"
+
+[project.urls]
+Homepage = "https://github.com/baicai-1145/pyradius"
+Repository = "https://github.com/baicai-1145/pyradius"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pyradius = ["_neon_src/*.c", "_neon_src/*.h", "_tables/*.npz"]
