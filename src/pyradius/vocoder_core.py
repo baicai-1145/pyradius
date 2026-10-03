@@ -420,7 +420,14 @@ class VocoderState:
         nb, N, NB, n_write, hop = self.nbands, self.N, self.nb_bins, self.n_write, self.hop
         cap = 4 * n_write
         self.ring_cap = cap
-        self.ring = np.zeros((nb, cap), dtype=np.float32)
+        # [nch][nbands][cap]: one band ring *per channel*.
+        #
+        # The C engine allocates a single [nbands][cap] plane and feeds it from
+        # channel 0 only, so every channel's analysis reads the same data and the
+        # vocoder collapses stereo to a phantom centre. This port used to reproduce
+        # that; `feed` now splits each channel separately, which means the output no
+        # longer matches the C engine on stereo input.
+        self.ring = np.zeros((self.nch, nb, cap), dtype=np.float32)
 
         t = get_tables(self.sr)
         if self.sr == 44100:
@@ -496,7 +503,48 @@ class VocoderState:
         self.mask_table_8f8 = np.zeros(NB, dtype=np.float32)
         self.sync_weight_buf = np.zeros(NB, dtype=np.float32)
         self.peak_count = 0
-        self.sync_sens_3496 = F32(0.0)
+        # Stereo phase-synchronisation sensitivity (the C struct's +0x3496). Read
+        # only by _ev_sync, and only when nch >= 2 and peak_count >= 1; it is the
+        # `sens` argument of synchronize_stereo_phases /
+        # synchronize_stereo_phases_nch2_fast (and of the route-B gran_sync2).
+        #
+        # Do not "tidy" this back to 0.0. It looks like a harmless neutral value and
+        # is the exact opposite:
+        #
+        #     v10 = (1 / (sens + 1e-6)) * |m0 - m1| / (m0 + m1 + 1e-6)
+        #     v11 = 0 if v10 <= 0 else min(v10 / 0.7, 1)
+        #     w   = sqrt(1 - v11)
+        #
+        # With sens = 0, v10 is ~1e6 * v9, i.e. always far above 0.7, so v11 = 1 and
+        # w = sqrt(0) = 0 for every bin. SynchronizeStereoPhases then blends the
+        # inter-channel phase difference towards the analysis one with weight
+        # exactly zero, which makes the whole stage a silent no-op — no error, no
+        # trace, just no stereo phase coherence. That was the state of this port
+        # until it was fixed: on the acceptance corpus at +3 semitones the
+        # magnitude-squared coherence between L and R fell to 0.02-0.11 per band
+        # (input 0.19-0.74, Adobe Audition 0.20-0.88), corr(L,R) to 0.0192, and the
+        # render came out ~2.3 dB quieter than the reference because two channels
+        # whose phases have drifted apart sum to less energy than two that have not.
+        #
+        # 0.75 (0x3F400000) is not a tuned preference. It is the sensitivity the
+        # parity corpus for this operator was captured with (test_ops_parity.py
+        # TestSync reads it as `sens` per case; the Rust port pins the same value as
+        # SYNC_SENS_BITS in noise.rs), i.e. what the operator was validated against.
+        #
+        # Note how selective the restored weight still is, since v9 is the relative
+        # magnitude imbalance between the two channels. It reaches zero once
+        # v9 >= 0.7 * (0.75 + 1e-6) = 0.525:
+        #
+        #     v9:     0.0    0.1    0.2    0.3    0.4    0.5    0.525+
+        #     w:      1.00   0.90   0.79   0.65   0.49   0.22   0.0
+        #
+        # So the stage only acts where the two channels are within about half a
+        # magnitude of each other at a peak, and deliberately does nothing where
+        # they are not — that is the operator's intended width-preserving
+        # behaviour, not a weak fix. It is also why the sync alone was not enough:
+        # before `feed` was split per channel, the two channels' analyses were
+        # unrelated, so they rarely met inside those regions either.
+        self.sync_sens_3496 = F32(0.75)
         self.pitch_freq_169 = F32(0.0)
         self.pitch_metric_168 = F32(0.0)
         self.scratch_f = np.zeros(8, dtype=np.float32)
@@ -669,6 +717,13 @@ class VocoderState:
             return self._cg_ok
         if not ROUTE_B_FAST or _neon is None or not _neon.granule_ok():
             return False
+        if self.nch > 1:
+            # The route-B granule kernels index a single [nbands][cap] ring plane and
+            # a single sync sensitivity baked at build time, i.e. the old
+            # channel-0-only layout. Building them here would silently undo the
+            # per-channel stereo fix, so the fast path stays off for multichannel
+            # input; mono is unaffected.
+            return False
         return self._cg_build()
 
     @property
@@ -731,13 +786,13 @@ class VocoderState:
     # events
     # =====================================================================
     def _ev_fill_granule(self, ch):
-        """FillGranule (acc reset + band sum)."""
+        """FillGranule (acc reset + band sum), for one channel."""
         if self._cg_fast:
             _neon.gran_fill(self._cg_ptr, 0, self.cursor_1376,
                             self._cg_p["ring"], self._cg_p["win"])
         else:
             self.acc[:] = 0.0
-            _fill_op(self.ring, self.win_table, self.acc, mode="fg",
+            _fill_op(self.ring[ch % self.nch], self.win_table, self.acc, mode="fg",
                      hop=self.hop_1420, n_write=self.n_write, n_bands=self.nbands,
                      cursor=self.cursor_1376,
                      buffered=bool(self.buffered_1352) if self.cursor_1376 >= self.hop_1420 else False,
@@ -746,12 +801,12 @@ class VocoderState:
         self._trace("FillGranule", ch)
 
     def _ev_fgwin_x4(self, ch):
-        """FillGranuleWin x nbands (acc already zeroed by the caller)."""
+        """FillGranuleWin x nbands (acc already zeroed by the caller), one channel."""
         if self._cg_fast:
             _neon.gran_fill(self._cg_ptr, 1, self.cursor_1376,
                             self._cg_p["ring"], self._cg_p["win"])
         else:
-            _fill_op(self.ring, self.win_table, self.acc, mode="fgw",
+            _fill_op(self.ring[ch % self.nch], self.win_table, self.acc, mode="fgw",
                      hop=self.hop_1420, n_write=self.n_write, n_bands=self.nbands,
                      n5d0=self.N, cursor=self.cursor_1376, buffered=True,
                      cap_scalar=self.ring_cap, ring_cap0_a=self.ring_cap // 2,
@@ -1252,34 +1307,45 @@ class VocoderState:
             self._sched_cdel = -1
 
     def feed(self, x, nin):
-        """rx_vc_feed — crossover into the band rings, then pump granules."""
+        """rx_vc_feed — crossover into the band rings, then pump granules.
+
+        One band split **per channel**, into that channel's own ring. The C engine
+        feeds only channel 0 into a single shared ring, which makes the vocoder
+        collapse stereo; see the note where ``self.ring`` is allocated. On dual-mono
+        input the two agree.
+        """
         if self._xo is None:
             self._xo = _ops.Crossover(self.sr, self.nbands)
+            self._xos = [self._xo] + [
+                _ops.Crossover(self.sr, self.nbands) for _ in range(self.nch - 1)
+            ]
         if (_ops._xover_zp_nb is not None and not EXACT_FFT):
-            xo = self._xo
-            x0 = np.ascontiguousarray(x[:nin, 0])
-            z = np.concatenate([xo.hist, x0])
-            xo.hist = z[-(xo.N - 1):]
-            bands = np.empty((self.nbands, nin), dtype=np.float32)
-            # Route B: the NEON xo_tree kernel is bit-identical to
-            # _xover_zp_nb (self-certified in pyradius.neon.xo_tree_ok(),
-            # which re-checks max|d| == 0 against the live numba kernel), so it
-            # is a drop-in replacement.  If the extension is unavailable or
-            # fails certification we stay on numba.
-            if _neon is not None and _neon.xo_tree is not None and \
-                    _neon.xo_tree_ok():
-                _neon.xo_tree_run(z, xo.taps_rev, bands, nin, xo.N,
-                                  self.nbands)
-            else:
-                _ops._xover_zp_nb(z, xo.taps_rev, bands, nin, xo.N,
-                                  self.nbands)
-            _ring_scatter_nb(self.ring, bands, self.fed_total, nin, 1023,
-                             self.ring_cap)
+            for c in range(self.nch):
+                xo = self._xos[c]
+                xc = np.ascontiguousarray(x[:nin, c])
+                z = np.concatenate([xo.hist, xc])
+                xo.hist = z[-(xo.N - 1):]
+                bands = np.empty((self.nbands, nin), dtype=np.float32)
+                # Route B: the NEON xo_tree kernel is bit-identical to
+                # _xover_zp_nb (self-certified in pyradius.neon.xo_tree_ok(),
+                # which re-checks max|d| == 0 against the live numba kernel), so it
+                # is a drop-in replacement.  If the extension is unavailable or
+                # fails certification we stay on numba.
+                if _neon is not None and _neon.xo_tree is not None and \
+                        _neon.xo_tree_ok():
+                    _neon.xo_tree_run(z, xo.taps_rev, bands, nin, xo.N,
+                                      self.nbands)
+                else:
+                    _ops._xover_zp_nb(z, xo.taps_rev, bands, nin, xo.N,
+                                      self.nbands)
+                _ring_scatter_nb(self.ring[c], bands, self.fed_total, nin, 1023,
+                                 self.ring_cap)
         else:
-            ch0 = np.ascontiguousarray(x[:nin, 0]).astype(np.float64)
-            bands = self._xo.process(ch0)
-            _ring_scatter_nb(self.ring, bands, self.fed_total, nin, 1023,
-                             self.ring_cap)
+            for c in range(self.nch):
+                xc = np.ascontiguousarray(x[:nin, c]).astype(np.float64)
+                bands = self._xos[c].process(xc)
+                _ring_scatter_nb(self.ring[c], bands, self.fed_total, nin, 1023,
+                                 self.ring_cap)
         self.fed_total += nin
         while self.cursor_1376 + self.hop_1420 < self.fed_total:
             self.process_granule()
